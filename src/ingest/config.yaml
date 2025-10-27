@@ -1,0 +1,103 @@
+# ===== Config avec renommage + regroupement admissions =====
+
+# DB/collection (interpolées depuis .env)
+database: ${MONGO_DB}
+collection: ${MONGO_COLLECTION}
+
+# 1) Renommage des en-têtes CSV -> noms "snake_case" sans espaces
+#    Ainsi, tout le reste de la config fait référence à ces noms normalisés.
+rename_map:
+  Name: name
+  Age: age
+  Gender: gender
+  "Blood Type": blood_type
+  "Medical Condition": medical_condition
+  "Date of Admission": date_of_admission
+  Doctor: doctor
+  Hospital: hospital
+  "Insurance Provider": insurance_provider
+  "Billing Amount": billing_amount
+  "Room Number": room_number
+  "Admission Type": admission_type
+  "Discharge Date": discharge_date
+  Medication: medication
+  "Test Results": test_results
+
+# 2) Clé de regroupement (un doc par patient)
+#    ⚠️ "name" peut causer des collisions (homonymes). Idéalement remplacer par un vrai patient_id.
+patient_key: name
+
+# 3) Champs de niveau patient (stables à l’échelle d’un patient)
+#    Stratégie : on prend la dernière valeur non nulle rencontrée lors du groupby.
+patient_fields:
+  - name
+  - age
+  - gender
+  - blood_type
+  - insurance_provider
+
+# 4) Champs de niveau admission (une entrée par séjour)
+#    Chaque ligne CSV -> un sous-document du tableau "admissions".
+admission_fields:
+  - date_of_admission
+  - discharge_date
+  - doctor
+  - hospital
+  - admission_type
+  - room_number
+  - medical_condition
+  - medication
+  - test_results
+  - billing_amount
+
+# 5) Typage (appliqué APRÈS renommage)
+casts:
+  name: str
+  age: int
+  gender: str
+  blood_type: str
+  insurance_provider: str
+
+  date_of_admission: date
+  discharge_date: date
+  doctor: str
+  hospital: str
+  admission_type: str
+  room_number: str      # parfois alphanum (ex: "B12")
+  medical_condition: str
+  medication: str
+  test_results: str
+  billing_amount: float
+
+# 6) Formats de dates
+date_formats:
+  - "%Y-%m-%d"
+  - "%d/%m/%Y"
+  - "%m/%d/%Y"
+
+datetime_formats:
+  - "%Y-%m-%dT%H:%M:%S"
+  - "%Y-%m-%d %H:%M:%S"
+
+# 7) Déduplication de lignes source (optionnel)
+#    Sans identifiant admission, on utilise un composé "name + date_of_admission + hospital + doctor".
+unique_keys:
+  - ["name", "date_of_admission", "hospital", "doctor"]
+
+# 8) Index Mongo
+#    - unique "name" (1 doc/patient) — à revoir si on introduit un vrai patient_id
+#    - dates d’admission imbriquées
+#    - champs de recherche fréquents
+indexes:
+  - ["name", "ASC", true]
+  - ["admissions.date_of_admission", "ASC", false]
+  - ["admissions.hospital", "ASC", false]
+  - ["admissions.doctor", "ASC", false]
+
+# 9) Règles de validation côté ETL (complémentaires au validator Mongo)
+validation:
+  required: ["name"]          # "age" et "gender" peuvent manquer dans certains jeux
+  non_negative: ["age", "billing_amount"]
+  allowed_values:
+    gender: ["M", "F", "X"]   # adapte si autre codification
+    blood_type: ["A+", "A-", "B+", "B-", "AB+", "AB-", "O+", "O-"]
