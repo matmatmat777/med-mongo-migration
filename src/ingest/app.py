@@ -1,6 +1,6 @@
 """
-ETL CSV -> MongoDB (Groupement par patient)
--------------------------------------------
+ETL CSV -> MongoDB (Groupement par patient) + Validation
+-------------------------------------------------------
 Chaque patient (Name) devient 1 document Mongo
 avec ses admissions regroupées dans un tableau.
 
@@ -13,11 +13,14 @@ Ce script :
 6️⃣ Supprime la contrainte "minimum: 0" sur billing_amount (collMod, avec fallback admin)
 7️⃣ Insère dans MongoDB (par lots)
 8️⃣ Crée/assure les index (robuste)
+9️⃣ (NOUVEAU) Valide et écrit ./data/reports/validation_report.json
 """
 
 import os
 import glob
+import json
 import warnings
+import argparse
 from datetime import datetime, date
 from typing import List, Dict, Any
 
@@ -267,7 +270,7 @@ def ensure_billing_negative_allowed(db, coll_name: str):
                 print("[INFO] Validateur inchangé (pas de 'minimum' à enlever côté utilisateur courant).")
                 return
         except OperationFailure as e:
-            print(f"[WARN] collMod refusé avec l'utilisateur courant ({e}). On tente en admin...")
+            print(f"[WARN] collMod refusé avec l'utilisateur courant ({e}). On tente en admin...)")
 
     # --- Fallback admin si disponible ---
     root_user = os.getenv("MONGO_INITDB_ROOT_USERNAME")
@@ -329,19 +332,154 @@ def ensure_indexes(coll, indexes_cfg):
 
 
 # ======================================================================
+#                           VALIDATION (NOUVEAU)
+# ======================================================================
+def validate_and_write_report(cfg: dict, client: MongoClient) -> dict:
+    """
+    Valide la migration et écrit ./data/reports/validation_report.json.
+    Renvoie le rapport (dict).
+    """
+    db = client[cfg["database"]]
+    coll = db[cfg["collection"]]
+
+    report = {"status": "running", "message": "", "stats": {}, "checks": []}
+
+    # --- Recompter patients attendus depuis les CSV ---
+    csv_glob = os.getenv("CSV_GLOB", "/data/input/*.csv")
+    files = sorted(glob.glob(csv_glob))
+    if not files:
+        report["checks"].append({"name": "csv_found", "ok": False, "info": f"Aucun CSV trouvé à {csv_glob}"})
+        expected_patients = None
+    else:
+        df = pd.concat([pd.read_csv(f) for f in files], ignore_index=True)
+        # appliquer rename_map pour retrouver la clé patient
+        rename_map = cfg.get("rename_map", {})
+        if rename_map:
+            df = df.rename(columns=rename_map)
+        patient_key = cfg.get("patient_key")
+        if patient_key not in df.columns:
+            report["checks"].append({"name": "patient_key_in_csv", "ok": False,
+                                     "info": f"Colonne '{patient_key}' absente après rename_map"})
+            expected_patients = None
+        else:
+            expected_patients = df[patient_key].dropna().astype(str).str.strip().nunique()
+            report["stats"]["expected_distinct_patients_from_csv"] = expected_patients
+            report["checks"].append({"name": "csv_loaded", "ok": True,
+                                     "info": f"{len(df)} lignes, {expected_patients} patients distincts"})
+
+    # --- Comptage côté Mongo ---
+    actual_docs = coll.count_documents({})
+    report["stats"]["mongo_documents"] = actual_docs
+    report["checks"].append({"name": "mongo_count", "ok": True,
+                             "info": f"{actual_docs} documents dans {cfg['collection']}"})
+
+    if expected_patients is not None:
+        ok_cnt = (expected_patients == actual_docs)
+        report["checks"].append({
+            "name": "count_match",
+            "ok": ok_cnt,
+            "info": f"CSV patients={expected_patients} vs Mongo docs={actual_docs}"
+        })
+
+    # --- Vérifier index attendus ---
+    idx_info = coll.index_information()  # name -> spec
+    expected_indexes = cfg.get("indexes", [])
+    missing = []
+    for field, order, unique in expected_indexes:
+        direction = ASCENDING if str(order).upper() == "ASC" else DESCENDING
+        name = f"{field}_{1 if direction == ASCENDING else -1}"
+        if name not in idx_info:
+            missing.append(name)
+    report["checks"].append({
+        "name": "indexes_present",
+        "ok": len(missing) == 0,
+        "info": "OK" if not missing else f"Manquants: {', '.join(missing)}"
+    })
+
+    # --- Échantillon de documents: structure & types de base ---
+    sample = list(coll.find({}, {"_id": 0}).limit(200))
+    basic_ok = True
+    issues = []
+    gender_ok_values = {"M", "F", "X", None}
+
+    p_fields = set(cfg.get("patient_fields", []))
+    a_fields = cfg.get("admission_fields", [])
+    date_fields = {k for k, v in cfg.get("casts", {}).items() if v == "date"}
+
+    def is_datetime_or_none(v):
+        if v is None:
+            return True
+        return hasattr(v, "year") and hasattr(v, "month") and hasattr(v, "day")
+
+    for i, doc in enumerate(sample):
+        # admissions présent et list
+        if "admissions" not in doc or not isinstance(doc["admissions"], list):
+            basic_ok = False
+            issues.append(f"doc#{i}: 'admissions' absent ou non-list")
+            continue
+        # champs patient présents (si définis)
+        for pf in p_fields:
+            if pf not in doc:
+                basic_ok = False
+                issues.append(f"doc#{i}: champ patient manquant '{pf}'")
+        # validations admissions
+        for j, adm in enumerate(doc["admissions"][:5]):  # 5 premières admissions de chaque doc
+            if not isinstance(adm, dict):
+                basic_ok = False
+                issues.append(f"doc#{i} adm#{j}: non-dict")
+                continue
+            for af in a_fields:
+                if af not in adm:
+                    basic_ok = False
+                    issues.append(f"doc#{i} adm#{j}: champ admission manquant '{af}'")
+            # dates
+            for dfld in date_fields:
+                if dfld in adm and not is_datetime_or_none(adm[dfld]):
+                    basic_ok = False
+                    issues.append(f"doc#{i} adm#{j}: '{dfld}' n'est pas date/None")
+        # gender enum
+        if "gender" in doc:
+            val = doc["gender"]
+            if val not in gender_ok_values:
+                basic_ok = False
+                issues.append(f"doc#{i}: gender invalide '{val}'")
+
+    report["checks"].append({
+        "name": "sample_structure_validation",
+        "ok": basic_ok,
+        "info": "OK" if basic_ok else f"Problèmes: {len(issues)} (voir 'problems')"
+    })
+    if issues:
+        report["problems"] = issues[:200]  # limite
+
+    # --- Statut global ---
+    all_ok = all(c.get("ok", False) for c in report["checks"] if c["name"] != "count_match") and \
+             all(c.get("ok", True) for c in report["checks"] if c["name"] == "count_match")
+    report["status"] = "ok" if all_ok else "fail"
+    report["message"] = "Validation terminée"
+
+    # --- Écriture du rapport ---
+    out_dir = "./data/reports"
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, "validation_report.json")
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(report, f, ensure_ascii=False, indent=2, default=str)
+
+    print(f"[INFO] Rapport écrit: {out_path} (status={report['status']})")
+    return report
+
+
+# ======================================================================
 #                                MAIN
 # ======================================================================
-def main():
-    load_dotenv(override=True)
-    cfg = load_config("config.yaml")
-
+def run_migration(cfg: dict):
     csv_glob = os.getenv("CSV_GLOB", "/data/input/*.csv")
     strict_types = env_bool("STRICT_TYPES", True)
 
     files = sorted(glob.glob(csv_glob))
     if not files:
         print(f"[WARN] No CSV found at {csv_glob}")
-        return
+        return 0
 
     # Lecture de tous les CSV concaténés
     df = pd.concat([pd.read_csv(f) for f in files], ignore_index=True)
@@ -386,35 +524,67 @@ def main():
     ensure_billing_negative_allowed(db, cfg["collection"])
 
     # --- Insertion par lots (messages < 16MB) ---
+    inserted = 0
     if not docs:
         print("[INFO] No documents to insert.")
     else:
         BATCH_SIZE = 1000  # Sûr. On peut augmenter si besoin.
-        inserted = 0
         try:
             for i in range(0, len(docs), BATCH_SIZE):
                 batch = docs[i:i + BATCH_SIZE]
-                # Optionnel: vérifier la taille BSON de chaque doc
-                # for d in batch:
-                #     if bson_size(d) > MAX_BSON_DOC:
-                #         ...
                 res = coll.insert_many(batch, ordered=False)
                 inserted += len(res.inserted_ids)
             print(f"[INFO] Inserted {inserted} patient documents in batches of {BATCH_SIZE}.")
         except BulkWriteError as bwe:
-            # Si jamais le validateur/typage bloque encore quelque chose, on log un résumé
             details = bwe.details or {}
             write_errors = details.get("writeErrors", [])
             print(f"[ERROR] BulkWriteError: {len(write_errors)} erreurs. Détails (extrait):")
             for e in write_errors[:5]:
                 print(f"  - idx={e.get('index')} code={e.get('code')} err={e.get('errmsg')}")
-            # on relance l'exception pour que le conteneur sorte en échec (visibilité CI)
             raise
 
     # --- Indexes robustes (ne casse pas les index existants, évite les conflits) ---
     ensure_indexes(coll, cfg.get("indexes", []))
     print("[INFO] Indexes ensured.")
     print("[INFO] Migration completed successfully.")
+    return inserted
+
+
+def build_mongo_client(cfg: dict) -> MongoClient:
+    return MongoClient(
+        host=os.getenv("MONGO_HOST"),
+        port=int(os.getenv("MONGO_PORT", "27017")),
+        username=os.getenv("MONGO_APP_USERNAME"),
+        password=os.getenv("MONGO_APP_PASSWORD"),
+        authSource=os.getenv("MONGO_DB"),
+    )
+
+
+def main():
+    load_dotenv(override=True)
+    cfg = load_config("config.yaml")
+
+    parser = argparse.ArgumentParser(description="ETL CSV -> MongoDB + Validation")
+    sub = parser.add_subparsers(dest="command")
+
+    p_migrate = sub.add_parser("migrate", help="Exécuter l'ETL (par défaut)")
+    p_migrate.add_argument("--and-validate", action="store_true",
+                           help="Exécuter l'ETL puis la validation")
+
+    sub.add_parser("validate", help="Exécuter uniquement la validation")
+
+    # Comportement par défaut = migrate
+    args = parser.parse_args()
+    if args.command in (None, "migrate"):
+        inserted = run_migration(cfg)
+        if args.command == "migrate" and getattr(args, "and-validate", False):
+            client = build_mongo_client(cfg)
+            validate_and_write_report(cfg, client)
+    elif args.command == "validate":
+        client = build_mongo_client(cfg)
+        validate_and_write_report(cfg, client)
+    else:
+        parser.print_help()
 
 
 if __name__ == "__main__":

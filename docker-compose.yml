@@ -37,7 +37,7 @@ services:
       CSV_GLOB: /data/input/*.csv    # on s'assure que l'app lise bien les fichiers montés
     volumes:
       - ./data/input:/data/input:ro  # monte les CSV en lecture seule dans le conteneur
-      - ./data/reports:/data/reports # monte le dossier des rapports en lecture/écriture
+      - ./data/reports:/app/data/reports # monte le dossier des rapports en lecture/écriture
     command: ["python", "app.py"]    # lance notre script (peut être remplacé par pytest pour les tests)
 
 volumes:
