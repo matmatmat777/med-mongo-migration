@@ -1,45 +1,45 @@
-# ---------- Orchestration Docker Compose ----------
-# Objectif : démarrer 2 services :
-# 1) "mongo" : base MongoDB avec script d'initialisation
-# 2) "migration" : notre app Python qui lit des CSV et les insère dans Mongo
-
+version: "3.9"
 
 services:
   mongo:
-    image: mongo:7                # version récente de MongoDB
+    image: mongo:7
     container_name: mongo
-    restart: unless-stopped       # redémarre sauf arrêt manuel
     ports:
-      - "27018:27017"             # expose le port pour se connecter depuis l'hôte (Compass, etc.)
+      - "27018:27017"
     environment:
-      # Variables standard de l'image officielle pour initialiser un user root
-      MONGO_INITDB_ROOT_USERNAME: ${MONGO_INITDB_ROOT_USERNAME}
-      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_INITDB_ROOT_PASSWORD}
-      MONGO_INITDB_DATABASE: ${MONGO_INITDB_DATABASE}
-      # On passe aussi l'user applicatif à notre script init.js
-      MONGO_APP_USERNAME: ${MONGO_APP_USERNAME}
-      MONGO_APP_PASSWORD: ${MONGO_APP_PASSWORD}
+      MONGO_INITDB_ROOT_USERNAME: root
+      MONGO_INITDB_ROOT_PASSWORD: example
     volumes:
-      - mongo_data:/data/db                       # volume persistant pour les données Mongo
-      - ./mongo-init:/docker-entrypoint-initdb.d:ro  # scripts d'init exécutés au 1er démarrage
+      - mongo_data:/data/db
+      - ./mongo-init:/docker-entrypoint-initdb.d:ro
 
-  migration:
-    build:
-      context: .          # on construit à partir du dossier de l'app
-      dockerfile: src/ingest/Dockerfile
-    container_name: migration
-    depends_on:
-      - mongo                        # garantit que "mongo" démarre avant
-    env_file:
-      - .env                         # charge toutes nos variables (DB, CSV_GLOB, etc.)
+  # (optionnel) UI web
+  mongo-express:
+    image: mongo-express:1.0.2-20
+    depends_on: [mongo]
+    ports:
+      - "8081:8081"
     environment:
-      MONGO_HOST: mongo              # sécurité: on force le host pour l'app (dans le réseau Docker)
-      CSV_GLOB: /data/input/*.csv    # on s'assure que l'app lise bien les fichiers montés
+      ME_CONFIG_MONGODB_ADMINUSERNAME: root
+      ME_CONFIG_MONGODB_ADMINPASSWORD: example
+      ME_CONFIG_MONGODB_URL: mongodb://root:example@mongo:27017/?authSource=admin
+
+  ingest:
+    build:
+      context: .
+      dockerfile: src/ingest/Dockerfile
+    depends_on: [mongo]
+    environment:
+      # chemins dans le conteneur ingest
+      CSV_PATH: /data/input/patients.csv
+      REPORTS_DIR: /data/reports/migration
+      ENABLE_MONGO_INSERT: "1"
+      # connexion Mongo (user applicatif créé par init.js)
+      MONGO_URI: mongodb://ingest_user:ingest_pass@mongo:27017/meddb?authSource=meddb
+      MONGO_DB: meddb
+      MONGO_COLLECTION: patients
     volumes:
-      - ./data/input:/data/input:ro  # monte les CSV en lecture seule dans le conteneur
-      - ./data/reports:/app/data/reports # monte le dossier des rapports en lecture/écriture
-    command: ["python", "app.py"]    # lance notre script (peut être remplacé par pytest pour les tests)
+      - ./data:/data:rw
 
 volumes:
   mongo_data:
-    driver: local

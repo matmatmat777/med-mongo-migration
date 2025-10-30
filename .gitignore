@@ -1,4 +1,22 @@
+# Environnement & secrets
 .env
-__pycache__/
-*.pyc
+
+# Données locales
 data/
+*.csv
+*.json
+
+# Fichiers Docker
+mongo_data/
+__pycache__/
+
+# Fichiers temporaires Python
+*.pyc
+*.pyo
+*.pyd
+*.log
+
+# Outils IDE
+.vscode/
+.idea/
+.DS_Store

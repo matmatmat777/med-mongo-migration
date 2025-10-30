@@ -1,88 +1,81 @@
-// mongo-init/init.js
-// Initialisation unique : crée l'utilisateur applicatif + collection "patients" avec validator
-// + index (unique) sur name et index sur admissions.date_of_admission
-// NOTE: ce script s'exécute uniquement au 1er démarrage d'un volume de données vierge.
+// ------------------------------------------------------------
+// init.js  — Création DB + utilisateurs + index (version finale)
+// ------------------------------------------------------------
 
-(() => {
-  const dbName = process.env.MONGO_INITDB_DATABASE || 'med_db';
-  const appUser = process.env.MONGO_APP_USERNAME || 'ingestor';
-  const appPwd  = process.env.MONGO_APP_PASSWORD || 'ingestor_password';
+// 1️⃣ Configuration de base
+const dbName = "meddb";
+const collName = "patients";
 
-  print(`[init.js] Initializing DB '${dbName}' and user '${appUser}'`);
-  db = db.getSiblingDB(dbName);
+// utilisateurs applicatifs
+const appUser = "ingest_user";
+const appPass = "ingest_pass"; // 🔒 remplace <fort> par un vrai mot de passe robuste
+const analystUser = "analyst_read";
+const analystPass = "analyst_pass"; // 🔒 idem
 
-  // 1) Créer l'utilisateur applicatif (moindre privilège possible plus tard)
-  try {
+// Connexion à la base applicative
+const db = db.getSiblingDB(dbName);
+
+// 2️⃣ Création des utilisateurs si absents
+try {
+  if (!db.getUser(appUser)) {
+    print(`[init] Creating user ${appUser} (readWrite)…`);
     db.createUser({
       user: appUser,
-      pwd: appPwd,
-      roles: [
-        { role: "readWrite", db: dbName },
-        { role: "dbOwner", db: dbName }
-      ]
+      pwd: appPass,
+      roles: [{ role: "readWrite", db: dbName }],
     });
-    print(`[init.js] User '${appUser}' created on DB '${dbName}'.`);
-  } catch (e) {
-    print(`[init.js] createUser warning: ${e}`);
+  } else {
+    print(`[init] User ${appUser} already exists — skipping`);
   }
 
-  // 2) Créer la collection "patients" avec un validator JSON Schema
-  // IMPORTANT : on utilise les noms de champs "normalisés" (snake_case) après rename_map
-  //   - name, age, gender, blood_type, medical_condition, insurance_provider
-  //   - admissions[].date_of_admission, discharge_date, doctor, hospital, admission_type, room_number, billing_amount, medication, test_results
-  try {
-    db.createCollection("patients", {
-      validator: {
-        $jsonSchema: {
-          bsonType: "object",
-          required: ["name", "admissions"],
-          properties: {
-            name:                { bsonType: ["string"] },
-            age:                 { bsonType: ["int","long","null"], minimum: 0 },
-            gender:              { enum: ["M","F","X", null] },
-            blood_type:          { bsonType: ["string","null"] },
-            medical_condition:   { bsonType: ["string","null"] },
-            insurance_provider:  { bsonType: ["string","null"] },
-            admissions: {
-              bsonType: "array",
-              items: {
-                bsonType: "object",
-                properties: {
-                  date_of_admission: { bsonType: ["date","null"] },
-                  discharge_date:     { bsonType: ["date","null"] },
-                  doctor:             { bsonType: ["string","null"] },
-                  hospital:           { bsonType: ["string","null"] },
-                  admission_type:     { bsonType: ["string","null"] },
-                  room_number:        { bsonType: ["int","long","null"], minimum: 0 },
-                  billing_amount:     { bsonType: ["double","int","long","decimal","null"], minimum: 0 },
-                  medication:         { bsonType: ["string","null"] },
-                  test_results:       { bsonType: ["string","null"] }
-                },
-                additionalProperties: true
-              }
-            }
-          },
-          additionalProperties: true
-        }
-      }
+  if (!db.getUser(analystUser)) {
+    print(`[init] Creating user ${analystUser} (read)…`);
+    db.createUser({
+      user: analystUser,
+      pwd: analystPass,
+      roles: [{ role: "read", db: dbName }],
     });
-    print("[init.js] Collection 'patients' created with validator.");
-  } catch (e) {
-    if (e.codeName === 'NamespaceExists') {
-      print("[init.js] Collection 'patients' already exists (skipping).");
-    } else {
-      throw e;
-    }
+  } else {
+    print(`[init] User ${analystUser} already exists — skipping`);
   }
+} catch (e) {
+  print(`[init][WARN] createUser error: ${e}`);
+}
 
-  // 3) Index
-  try {
-    db.patients.createIndex({ name: 1 }, { unique: true, sparse: true });
-    db.patients.createIndex({ "admissions.date_of_admission": 1 });
-    print("[init.js] Indexes created.");
-  } catch (e) {
-    print(`[init.js] createIndex warning: ${e}`);
+// 3️⃣ Création de la collection si absente
+try {
+  const exists = db.getCollectionNames().includes(collName);
+  if (!exists) {
+    print(`[init] Creating collection ${collName}…`);
+    db.createCollection(collName);
+  } else {
+    print(`[init] Collection ${collName} already exists — skipping`);
   }
+} catch (e) {
+  print(`[init][WARN] createCollection error: ${e}`);
+}
 
-  print("[init.js] Initialization complete.");
-})();
+// 4️⃣ Création des index (unicité + filtres)
+try {
+  print("[init] Ensuring indexes on patients…");
+
+  // index d’unicité sur le modèle stocké
+  db[collName].createIndex(
+    { "Name": 1, "Age": 1, "Gender": 1, "Blood Type": 1 },
+    { name: "uniq_name_age_gender_blood", unique: true }
+  );
+
+  // index utiles
+  db[collName].createIndex({ "Name": 1 }, { name: "idx_Name" });
+  db[collName].createIndex({ "Blood Type": 1 }, { name: "idx_BloodType" });
+  db[collName].createIndex(
+    { "Admissions.Date of Admission": -1 },
+    { name: "idx_Admissions_DoA_desc" }
+  );
+
+  print("[init] Indexes ensured ✅");
+} catch (e) {
+  print(`[init][ERROR] index creation failed: ${e}`);
+}
+
+print("[init] Initialization completed ✅");

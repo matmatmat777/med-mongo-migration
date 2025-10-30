@@ -1,591 +1,320 @@
+# -*- coding: utf-8 -*-
 """
-ETL CSV -> MongoDB (Groupement par patient) + Validation
--------------------------------------------------------
-Chaque patient (Name) devient 1 document Mongo
-avec ses admissions regroupées dans un tableau.
+🩺 app.py — Migration CSV vers MongoDB avec nettoyage et regroupement
 
-Ce script :
-1️⃣ Charge le CSV
-2️⃣ Renomme les colonnes pour uniformiser
-3️⃣ Cast les types selon config.yaml
-4️⃣ Normalise certains champs (gender, room_number)
-5️⃣ Regroupe par patient
-6️⃣ Supprime la contrainte "minimum: 0" sur billing_amount (collMod, avec fallback admin)
-7️⃣ Insère dans MongoDB (par lots)
-8️⃣ Crée/assure les index (robuste)
-9️⃣ (NOUVEAU) Valide et écrit ./data/reports/validation_report.json
+But du script :
+---------------
+➡ Lire un fichier CSV contenant les admissions de patients.
+➡ Nettoyer et normaliser les données (corriger les majuscules, espaces, etc.).
+➡ Regrouper toutes les admissions d’un même patient dans une seule fiche.
+➡ Sauvegarder le résultat dans un fichier JSON.
+➡ (Optionnel) Insérer ou mettre à jour les patients dans MongoDB.
+
+Le résultat est donc un JSON et une base Mongo avec une structure :
+{
+  "Name": "Ashley Garcia",
+  "Age": 59,
+  "Gender": "Male",
+  "Blood Type": "O-",
+  "Admissions": [ {...}, {...} ]
+}
 """
 
-import os
-import glob
-import json
-import warnings
-import argparse
-from datetime import datetime, date
-from typing import List, Dict, Any
+# =======================================================================
+# 🧩 IMPORTS : bibliothèques nécessaires
+# =======================================================================
 
-import pandas as pd
-from pymongo import MongoClient, ASCENDING, DESCENDING
-from pymongo.errors import OperationFailure, BulkWriteError
-from dotenv import load_dotenv
-import yaml
-from bson import BSON
+import os          # pour lire les variables d’environnement (ex: MONGO_URI)
+import json        # pour exporter les données en JSON
+import time        # pour les pauses lors de la connexion Mongo
+from pathlib import Path   # pour manipuler les chemins de fichiers facilement
+from typing import List, Dict, Any   # pour mieux typer les fonctions (lisibilité)
 
-
-# --- Sécurité : rester largement sous la limite BSON 16 MB ---
-MAX_BSON_DOC = 15 * 1024 * 1024  # 15MB marge sous la limite 16MB
+import pandas as pd   # bibliothèque de manipulation de données tabulaires (CSV)
+from pymongo import MongoClient, UpdateOne   # client MongoDB et opérations bulk
+from pymongo.errors import ServerSelectionTimeoutError, BulkWriteError   # erreurs Mongo
 
 
-# ======================================================================
-#                         OUTILS GÉNÉRAUX
-# ======================================================================
-def bson_size(doc: dict) -> int:
-    """Taille BSON estimée d'un document."""
-    return len(BSON.encode(doc))
+# =======================================================================
+# ⚙️ CONFIGURATION & OUTILS DE BASE
+# =======================================================================
 
-
-def chunk_list(seq, size):
-    """Découpe une liste en sous-listes de taille 'size' (itératif)."""
-    for i in range(0, len(seq), size):
-        yield seq[i:i + size]
-
-
-def to_bson_datetime(v):
+def load_config():
     """
-    Convertit date/str/pandas.Timestamp en datetime.datetime (naive, 00:00:00).
-    Mongo attend un 'date' BSON = datetime python.
+    Lis les variables d’environnement (ou met des valeurs par défaut)
+    Ces variables sont définies dans docker-compose.yml.
     """
-    if v is None or (isinstance(v, float) and pd.isna(v)):
-        return None
-    if isinstance(v, datetime):
-        return v  # déjà bon
-    if isinstance(v, date):
-        return datetime(v.year, v.month, v.day)  # 00:00:00
-    try:
-        ts = pd.to_datetime(v, errors="coerce")
-        if pd.isna(ts):
-            return None
-        return ts.to_pydatetime().replace(tzinfo=None)
-    except Exception:
-        return None
+    CSV_PATH = os.getenv("CSV_PATH", "/data/input/patients.csv")  # chemin du CSV
+    REPORTS_DIR = Path(os.getenv("REPORTS_DIR", "/data/reports/migration"))  # dossier où écrire le JSON
+    MONGO_URI = os.getenv("MONGO_URI", "mongodb://root:example@mongo:27017/?authSource=admin")
+    DB_NAME = os.getenv("MONGO_DB") or os.getenv("MONGO_INITDB_DATABASE", "meddb")
+    ENABLE_MONGO_INSERT = os.getenv("ENABLE_MONGO_INSERT", "1") == "1"  # activer l’insertion Mongo ?
+    return CSV_PATH, REPORTS_DIR, MONGO_URI, DB_NAME, ENABLE_MONGO_INSERT
 
 
-def env_bool(name: str, default: bool = False) -> bool:
-    """Lit une variable d'environnement booléenne."""
-    v = os.getenv(name)
-    return default if v is None else str(v).lower() in {"1", "true", "yes", "y", "on"}
+def get_client(mongo_uri: str) -> MongoClient:
+    """Crée une connexion MongoDB (client)."""
+    return MongoClient(mongo_uri, serverSelectionTimeoutMS=5000)
 
 
-def load_config(path: str) -> dict:
+def wait_for_mongo(client: MongoClient, retries: int = 30, delay: int = 2) -> None:
     """
-    Charge config.yaml et remplace ${VAR} par les valeurs d'environnement.
-    Permet d'utiliser des env vars dans le YAML.
+    Attends que Mongo soit prêt avant d’insérer.
+    - Essaie un 'ping' jusqu’à 30 fois (toutes les 2 secondes).
     """
-    with open(path, "r", encoding="utf-8") as f:
-        raw = f.read()
-    for k, v in os.environ.items():
-        raw = raw.replace(f"${{{k}}}", v)
-    return yaml.safe_load(raw)
-
-
-def parse_date(val, fmts):
-    """Essaie plusieurs formats de date jusqu’à trouver le bon (renvoie date)."""
-    if pd.isna(val):
-        return None
-    for f in fmts:
+    for _ in range(retries):
         try:
-            return datetime.strptime(str(val), f).date()
-        except Exception:
-            pass
-    return None
+            client.admin.command("ping")  # si Mongo répond, c’est prêt
+            print("✅ MongoDB connecté")
+            return
+        except ServerSelectionTimeoutError:
+            print(f"⏳ MongoDB non prêt, retry dans {delay}s...")
+            time.sleep(delay)
+    raise RuntimeError("❌ Impossible de se connecter à MongoDB")
 
 
-def cast_series(s: pd.Series, target: str, date_fmts: List[str]):
-    """
-    Convertit les colonnes selon le typage du YAML.
-    NB: pour les entiers avec trous, on utilise Int64 (nullable).
-    """
-    if target == "int":
-        return pd.to_numeric(s, errors="coerce").astype("Int64")
-    if target == "float":
-        return pd.to_numeric(s, errors="coerce")
-    if target == "bool":
-        mapping = {"true": True, "false": False, "1": True, "0": False, "yes": True, "no": False}
-        return s.astype(str).str.lower().map(mapping)
-    if target == "date":
-        return s.map(lambda x: parse_date(x, date_fmts))
-    if target == "str":
-        # Garder tel quel mais en string
-        return s.astype(str)
+# =======================================================================
+# 🧹 LECTURE ET RÉSUMÉ DU FICHIER CSV
+# =======================================================================
+
+def read_data(path: str) -> pd.DataFrame:
+    """Lit un fichier CSV ou JSON et renvoie un DataFrame pandas."""
+    print(f"📄 Lecture: {path}")
+    if path.lower().endswith(".json"):
+        return pd.read_json(path)
+    return pd.read_csv(path, low_memory=False)
+
+def summarize(df: pd.DataFrame) -> None:
+    """Affiche des infos utiles sur le jeu de données."""
+    print("\nℹ️  Infos dataset:")
+    df.info()
+    print("\n🔎 Valeurs manquantes:\n", df.isnull().sum())
+    print("\n🧮 Doublons (lignes strictes):", df.duplicated().sum())
+
+
+# =======================================================================
+# 🧠 NORMALISATION DES CHAMPS
+# =======================================================================
+
+def _clean_str(x: str) -> str:
+    """Nettoie les chaînes : supprime les espaces, tabulations, doublons, etc."""
+    if pd.isna(x):
+        return ""
+    s = " ".join(str(x).strip().replace("\t", " ").split())
+    s = s.replace(" ,", ",").replace(", ,", ",").strip()
     return s
 
+def normalize_name(raw: str) -> str:
+    """Met les noms en 'Title Case' (Ashley Garcia, pas ASHLEY GARCIA)"""
+    s = _clean_str(raw)
+    if not s:
+        return ""
+    parts = [p for p in s.replace(",", " ").split(" ") if p]
+    parts = [p.lower().capitalize() if len(p) > 1 else p.upper() for p in parts]
+    # Correction spéciale pour les noms commençant par "Mc"
+    fixed = []
+    for p in parts:
+        if p.startswith("Mc") and len(p) > 2:
+            p = "Mc" + p[2:].capitalize()
+        fixed.append(p)
+    return " ".join(fixed)
 
-def _last_non_null(series: pd.Series):
-    """Retourne la dernière valeur non vide d'une colonne (utile pour l'entête patient)."""
-    for val in reversed(series.tolist()):
-        if pd.notna(val) and str(val).strip() != "":
-            return val
-    return None
+def normalize_gender(raw: str) -> str:
+    """Uniformise les genres ('Male' ou 'Female')."""
+    s = _clean_str(raw).lower()
+    if s in ("male", "m", "masculin"):
+        return "Male"
+    if s in ("female", "f", "feminin", "féminin"):
+        return "Female"
+    return s.capitalize() if s else ""
+
+def normalize_blood(raw: str) -> str:
+    """Met les groupes sanguins en forme (A+, B-, O-, etc.)"""
+    s = _clean_str(raw).upper().replace(" ", "")
+    valid = {"A","A+","A-","B","B+","B-","O","O+","O-","AB","AB+","AB-"}
+    return s if s in valid else s
 
 
-# ======================================================================
-#                   NORMALISATIONS SPÉCIFIQUES DONNÉES
-# ======================================================================
-def normalize_gender_series(s: pd.Series) -> pd.Series:
+# =======================================================================
+# 🔄 TRANSFORMATION DES DONNÉES
+# =======================================================================
+
+GROUP_COLS_NORM = ["Name_norm", "Age", "Gender_norm", "Blood_norm"]
+
+def clean(df: pd.DataFrame) -> pd.DataFrame:
+    """Supprime les doublons stricts (lignes identiques)."""
+    return df.drop_duplicates()
+
+def group_patients(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Normalise 'gender' vers l'enum attendu par le validateur: 'M' | 'F' | 'X' | None.
-    Accepte diverses écritures ('male', 'Female', 'other', etc.).
+    Regroupe les lignes par patient (après normalisation des champs clés).
+    Chaque groupe devient un patient avec plusieurs admissions possibles.
     """
-    if s is None:
-        return s
+    df = df.copy()
+    df["Name_norm"]   = df["Name"].apply(normalize_name)
+    df["Gender_norm"] = df["Gender"].apply(normalize_gender)
+    df["Blood_norm"]  = df["Blood Type"].apply(normalize_blood)
 
-    def norm(x):
-        if x is None or (isinstance(x, float) and pd.isna(x)):
-            return None
-        val = str(x).strip().lower()
-        if val in {"m", "male", "man", "homme"}:
-            return "M"
-        if val in {"f", "female", "woman", "femme"}:
-            return "F"
-        if val in {"x", "other", "non-binary", "non binaire", "autre"}:
-            return "X"
-        # si inconnu, on met None pour ne pas casser la validation
-        return None
+    # On garde toutes les colonnes sauf celles utilisées pour le groupement
+    admission_cols = [c for c in df.columns if c not in ["Name","Age","Gender","Blood Type"] + GROUP_COLS_NORM]
 
-    return s.map(norm)
+    grouped = (
+        df.groupby(GROUP_COLS_NORM, dropna=False)[admission_cols]
+          .apply(lambda x: x.to_dict(orient="records"))  # liste de dicts = admissions
+          .reset_index(name="Admissions")
+    )
+
+    # On remet des noms propres pour l’export final
+    grouped["Name"] = grouped["Name_norm"]
+    grouped["Gender"] = grouped["Gender_norm"]
+    grouped["Blood Type"] = grouped["Blood_norm"]
+
+    return grouped[["Name","Age","Gender","Blood Type","Admissions"]]
 
 
-def normalize_room_number_series(s: pd.Series) -> pd.Series:
+def make_docs(grouped: pd.DataFrame) -> List[Dict[str, Any]]:
     """
-    Force room_number en numérique nullable (int64 pandas) pour matcher le schema.
-    (Le CSV peut contenir '255' en string -> on convertit.)
+    Convertit les groupes pandas en documents JSON.
+    - Déduplication stricte des admissions identiques
+    - Tri des admissions par Date of Admission
     """
-    if s is None:
-        return s
-    return pd.to_numeric(s, errors="coerce").astype("Int64")
+    docs: List[Dict[str, Any]] = []
+    for _, row in grouped.iterrows():
+        admissions = list(row["Admissions"])
 
+        # On crée une "signature" pour repérer les doublons exacts d’admission
+        seen = set()
+        unique_adm = []
+        for a in admissions:
+            sig = tuple(_clean_str(str(v)) for v in a.values())
+            if sig in seen:
+                continue
+            seen.add(sig)
+            unique_adm.append(a)
 
-# ======================================================================
-#                     GROUPAGE PAR PATIENT -> DOCUMENTS
-# ======================================================================
-def build_patient_docs(df: pd.DataFrame, cfg: dict) -> List[Dict[str, Any]]:
-    """
-    Regroupe les admissions par patient.
-    Exemple document final :
-    {
-      "name": "Jane Doe",
-      "age": 35,
-      "gender": "F",
-      "admissions": [ {...}, {...} ]
-    }
-    """
-    patient_key = cfg.get("patient_key")
-    p_fields = cfg.get("patient_fields", [])
-    a_fields = cfg.get("admission_fields", [])
-    date_fields = {k for k, v in cfg.get("casts", {}).items() if v == "date"}
-    docs = []
+        # Tri chronologique des admissions
+        def _adm_key(a):
+            return str(a.get("Date of Admission","")) or ""
 
-    for pid, g in df.groupby(patient_key, dropna=False):
-        g = g.reset_index(drop=True)
+        unique_adm.sort(key=_adm_key)
 
-        # --- Partie patient : dernières valeurs non nulles pour chaque champ ---
-        patient = {}
-        for c in p_fields:
-            if c in g.columns:
-                patient[c] = _last_non_null(g[c])
-        patient[patient_key] = patient.get(patient_key, pid)
-
-        # --- Partie admissions : une admission par ligne ---
-        admissions = []
-        for _, row in g.iterrows():
-            sub = {}
-            for c in a_fields:
-                if c in g.columns:
-                    val = row[c]
-                    if c in date_fields:
-                        val = to_bson_datetime(val)
-                    # normalisation NaN/NA -> None (sauf pour les strings déjà valides)
-                    sub[c] = None if (pd.isna(val) if not isinstance(val, str) else False) else val
-            admissions.append(sub)
-
-        patient["admissions"] = admissions
-        docs.append(patient)
-
+        doc = {
+            "Name": row["Name"],
+            "Age": int(row["Age"]) if pd.notna(row["Age"]) else None,
+            "Gender": row["Gender"],
+            "Blood Type": row["Blood Type"],
+            "Admissions": unique_adm
+        }
+        docs.append(doc)
     return docs
 
 
-# ======================================================================
-#           OUTILS VALIDATEUR : suppression du minimum sur billing
-# ======================================================================
-def _try_get_validator(db, coll_name: str) -> dict:
-    """Récupère le validator de la collection (ou {} si absent/inaccessible)."""
-    try:
-        info = db.command({"listCollections": 1, "filter": {"name": coll_name}})
-        batch = info.get("cursor", {}).get("firstBatch", [])
-        if batch:
-            return batch[0].get("options", {}).get("validator", {}) or {}
-    except Exception as e:
-        print(f"[WARN] get_validator a échoué: {e}")
-    return {}
+# =======================================================================
+# 🧪 DEBUG : détecter les patients à plusieurs admissions
+# =======================================================================
 
-
-def _remove_min_and_collmod(db_, coll_name: str, validator_: dict) -> bool:
+def debug_multi_admissions_from_csv(df: pd.DataFrame, reports_dir: Path) -> None:
     """
-    Enlève 'minimum: 0' sur admissions[].billing_amount dans validator_,
-    puis applique collMod. Renvoie True si modification effectuée.
+    Vérifie s’il existe des patients qui apparaissent plusieurs fois dans le CSV
+    (donc plusieurs admissions).
     """
-    changed = False
-    try:
-        props = validator_["$jsonSchema"]["properties"]
-        a_items = props["admissions"]["items"]["properties"]
-        billing = a_items.get("billing_amount", {})
-        if "minimum" in billing:
-            billing.pop("minimum", None)
-            changed = True
-    except Exception:
-        pass
+    tmp = df.copy()
+    tmp["Name_norm"]   = tmp["Name"].apply(normalize_name)
+    tmp["Gender_norm"] = tmp["Gender"].apply(normalize_gender)
+    tmp["Blood_norm"]  = tmp["Blood Type"].apply(normalize_blood)
 
-    if not changed:
-        return False
+    # Compte combien de fois chaque patient normalisé apparaît
+    grp_cols = ["Name_norm", "Age", "Gender_norm", "Blood_norm"]
+    counts = tmp.groupby(grp_cols, dropna=False).size().reset_index(name="rows")
 
-    db_.command({"collMod": coll_name, "validator": validator_})
-    print("[INFO] Validateur mis à jour (suppression de minimum sur admissions.billing_amount).")
-    return True
+    multi = counts[counts["rows"] > 1]
+    print(f"🔬 DEBUG CSV — groupes>1: {len(multi)} patients multi-admissions")
+    if len(multi) > 0:
+        sample_path = reports_dir / "multi_admissions_sample.csv"
+        tmp.merge(multi, on=grp_cols, how="inner").to_csv(sample_path, index=False)
+        print(f"🧪 Exemple écrit: {sample_path.resolve()}")
 
 
-def ensure_billing_negative_allowed(db, coll_name: str):
+# =======================================================================
+# 💾 EXPORT ET INSERTION DANS MONGO
+# =======================================================================
+
+def export_patients_json(docs: List[Dict[str, Any]], reports_dir: Path) -> Path:
+    """Sauvegarde tous les patients au format JSON."""
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    out = reports_dir / "patients.json"
+    with open(out, "w", encoding="utf-8") as f:
+        json.dump(docs, f, ensure_ascii=False, indent=2)
+    print(f"📝 Export écrit: {out.resolve()}")
+    return out
+
+
+def upsert_mongo(docs: List[Dict[str, Any]], client: MongoClient, db_name: str, coll_name: str = "patients") -> None:
     """
-    Enlève 'minimum: 0' sur admissions.billing_amount.
-    - 1er essai : avec l'utilisateur courant (app).
-    - Si échec (droits insuffisants / pas d'accès au validator), on bascule
-      automatiquement sur le compte admin fourni par l'env (fallback).
+    Met à jour ou insère chaque patient dans MongoDB.
+    La clé unique est basée sur (Name, Age, Gender, Blood Type).
     """
-    # --- Tentative avec l'utilisateur applicatif ---
-    current = _try_get_validator(db, coll_name)
-    if current:
-        try:
-            if _remove_min_and_collmod(db, coll_name, current):
-                return
-            else:
-                print("[INFO] Validateur inchangé (pas de 'minimum' à enlever côté utilisateur courant).")
-                return
-        except OperationFailure as e:
-            print(f"[WARN] collMod refusé avec l'utilisateur courant ({e}). On tente en admin...)")
+    col = client[db_name][coll_name]
+    ops = []
 
-    # --- Fallback admin si disponible ---
-    root_user = os.getenv("MONGO_INITDB_ROOT_USERNAME")
-    root_pwd = os.getenv("MONGO_INITDB_ROOT_PASSWORD")
-    host = os.getenv("MONGO_HOST", "localhost")
-    port = int(os.getenv("MONGO_PORT", "27017"))
-    dbname = db.name
+    for d in docs:
+        filt = {
+            "Name": d.get("Name"),
+            "Age": d.get("Age"),
+            "Gender": d.get("Gender"),
+            "Blood Type": d.get("Blood Type"),
+        }
+        ops.append(UpdateOne(filt, {"$set": d}, upsert=True))
 
-    if not (root_user and root_pwd):
-        print("[WARN] Pas d'identifiants admin dans l'env; on ne peut pas assouplir le validateur.")
+    if not ops:
+        print("⚠️ Aucun document à insérer.")
         return
 
     try:
-        admin_client = MongoClient(
-            host=host, port=port, username=root_user, password=root_pwd, authSource="admin"
-        )
-        admin_db = admin_client[dbname]
-        val_admin = _try_get_validator(admin_db, coll_name)
-        if not val_admin:
-            print("[WARN] Impossible de récupérer le validateur en admin (peut-être absent).")
-            return
-        if not _remove_min_and_collmod(admin_db, coll_name, val_admin):
-            print("[INFO] Validateur déjà OK (aucun minimum à enlever) côté admin.")
-    except Exception as e:
-        print(f"[WARN] Echec de modification du validateur en admin: {e}")
+        res = col.bulk_write(ops, ordered=False)
+        upserts = len(getattr(res, "upserted_ids", {}) or {})
+        print(f"✅ Upserts: {upserts}, Modifiés: {res.modified_count}, Mis à jour (matched): {res.matched_count}")
+    except BulkWriteError as e:
+        print("❌ Erreur BulkWrite:", json.dumps(e.details, indent=2))
 
 
-# ======================================================================
-#                       OUTIL INDEXATION (robuste)
-# ======================================================================
-def ensure_indexes(coll, indexes_cfg):
-    """
-    Crée les index listés dans config.yaml, SANS casser ceux déjà présents.
-    - Si un index de même nom existe, on le garde (évite IndexKeySpecsConflict).
-    - On ne force PAS 'sparse' ici (risque de conflit avec init.js).
-    """
-    existing = coll.index_information()  # dict: name -> spec
-    for field, order, unique in indexes_cfg:
-        direction = ASCENDING if str(order).upper() == "ASC" else DESCENDING
-        desired_name = f"{field}_{1 if direction == ASCENDING else -1}"
-
-        if desired_name in existing:
-            print(f"[INFO] Index déjà présent, on garde: {desired_name} -> {existing[desired_name]}")
-            continue
-
-        try:
-            coll.create_index(
-                [(field, direction)],
-                name=desired_name,
-                unique=bool(unique)
-            )
-            print(f"[INFO] Index créé: {desired_name} (unique={bool(unique)})")
-        except OperationFailure as e:
-            # 85/86 = conflits de nom/spéc; on log et on continue
-            if getattr(e, "code", None) in (85, 86):
-                print(f"[WARN] Conflit d'index pour {desired_name} ({e.code}). On ignore: {e}")
-                continue
-            raise
-
-
-# ======================================================================
-#                           VALIDATION (NOUVEAU)
-# ======================================================================
-def validate_and_write_report(cfg: dict, client: MongoClient) -> dict:
-    """
-    Valide la migration et écrit ./data/reports/validation_report.json.
-    Renvoie le rapport (dict).
-    """
-    db = client[cfg["database"]]
-    coll = db[cfg["collection"]]
-
-    report = {"status": "running", "message": "", "stats": {}, "checks": []}
-
-    # --- Recompter patients attendus depuis les CSV ---
-    csv_glob = os.getenv("CSV_GLOB", "/data/input/*.csv")
-    files = sorted(glob.glob(csv_glob))
-    if not files:
-        report["checks"].append({"name": "csv_found", "ok": False, "info": f"Aucun CSV trouvé à {csv_glob}"})
-        expected_patients = None
-    else:
-        df = pd.concat([pd.read_csv(f) for f in files], ignore_index=True)
-        # appliquer rename_map pour retrouver la clé patient
-        rename_map = cfg.get("rename_map", {})
-        if rename_map:
-            df = df.rename(columns=rename_map)
-        patient_key = cfg.get("patient_key")
-        if patient_key not in df.columns:
-            report["checks"].append({"name": "patient_key_in_csv", "ok": False,
-                                     "info": f"Colonne '{patient_key}' absente après rename_map"})
-            expected_patients = None
-        else:
-            expected_patients = df[patient_key].dropna().astype(str).str.strip().nunique()
-            report["stats"]["expected_distinct_patients_from_csv"] = expected_patients
-            report["checks"].append({"name": "csv_loaded", "ok": True,
-                                     "info": f"{len(df)} lignes, {expected_patients} patients distincts"})
-
-    # --- Comptage côté Mongo ---
-    actual_docs = coll.count_documents({})
-    report["stats"]["mongo_documents"] = actual_docs
-    report["checks"].append({"name": "mongo_count", "ok": True,
-                             "info": f"{actual_docs} documents dans {cfg['collection']}"})
-
-    if expected_patients is not None:
-        ok_cnt = (expected_patients == actual_docs)
-        report["checks"].append({
-            "name": "count_match",
-            "ok": ok_cnt,
-            "info": f"CSV patients={expected_patients} vs Mongo docs={actual_docs}"
-        })
-
-    # --- Vérifier index attendus ---
-    idx_info = coll.index_information()  # name -> spec
-    expected_indexes = cfg.get("indexes", [])
-    missing = []
-    for field, order, unique in expected_indexes:
-        direction = ASCENDING if str(order).upper() == "ASC" else DESCENDING
-        name = f"{field}_{1 if direction == ASCENDING else -1}"
-        if name not in idx_info:
-            missing.append(name)
-    report["checks"].append({
-        "name": "indexes_present",
-        "ok": len(missing) == 0,
-        "info": "OK" if not missing else f"Manquants: {', '.join(missing)}"
-    })
-
-    # --- Échantillon de documents: structure & types de base ---
-    sample = list(coll.find({}, {"_id": 0}).limit(200))
-    basic_ok = True
-    issues = []
-    gender_ok_values = {"M", "F", "X", None}
-
-    p_fields = set(cfg.get("patient_fields", []))
-    a_fields = cfg.get("admission_fields", [])
-    date_fields = {k for k, v in cfg.get("casts", {}).items() if v == "date"}
-
-    def is_datetime_or_none(v):
-        if v is None:
-            return True
-        return hasattr(v, "year") and hasattr(v, "month") and hasattr(v, "day")
-
-    for i, doc in enumerate(sample):
-        # admissions présent et list
-        if "admissions" not in doc or not isinstance(doc["admissions"], list):
-            basic_ok = False
-            issues.append(f"doc#{i}: 'admissions' absent ou non-list")
-            continue
-        # champs patient présents (si définis)
-        for pf in p_fields:
-            if pf not in doc:
-                basic_ok = False
-                issues.append(f"doc#{i}: champ patient manquant '{pf}'")
-        # validations admissions
-        for j, adm in enumerate(doc["admissions"][:5]):  # 5 premières admissions de chaque doc
-            if not isinstance(adm, dict):
-                basic_ok = False
-                issues.append(f"doc#{i} adm#{j}: non-dict")
-                continue
-            for af in a_fields:
-                if af not in adm:
-                    basic_ok = False
-                    issues.append(f"doc#{i} adm#{j}: champ admission manquant '{af}'")
-            # dates
-            for dfld in date_fields:
-                if dfld in adm and not is_datetime_or_none(adm[dfld]):
-                    basic_ok = False
-                    issues.append(f"doc#{i} adm#{j}: '{dfld}' n'est pas date/None")
-        # gender enum
-        if "gender" in doc:
-            val = doc["gender"]
-            if val not in gender_ok_values:
-                basic_ok = False
-                issues.append(f"doc#{i}: gender invalide '{val}'")
-
-    report["checks"].append({
-        "name": "sample_structure_validation",
-        "ok": basic_ok,
-        "info": "OK" if basic_ok else f"Problèmes: {len(issues)} (voir 'problems')"
-    })
-    if issues:
-        report["problems"] = issues[:200]  # limite
-
-    # --- Statut global ---
-    all_ok = all(c.get("ok", False) for c in report["checks"] if c["name"] != "count_match") and \
-             all(c.get("ok", True) for c in report["checks"] if c["name"] == "count_match")
-    report["status"] = "ok" if all_ok else "fail"
-    report["message"] = "Validation terminée"
-
-    # --- Écriture du rapport ---
-    out_dir = "./data/reports"
-    os.makedirs(out_dir, exist_ok=True)
-    out_path = os.path.join(out_dir, "validation_report.json")
-    with open(out_path, "w", encoding="utf-8") as f:
-        json.dump(report, f, ensure_ascii=False, indent=2, default=str)
-
-    print(f"[INFO] Rapport écrit: {out_path} (status={report['status']})")
-    return report
-
-
-# ======================================================================
-#                                MAIN
-# ======================================================================
-def run_migration(cfg: dict):
-    csv_glob = os.getenv("CSV_GLOB", "/data/input/*.csv")
-    strict_types = env_bool("STRICT_TYPES", True)
-
-    files = sorted(glob.glob(csv_glob))
-    if not files:
-        print(f"[WARN] No CSV found at {csv_glob}")
-        return 0
-
-    # Lecture de tous les CSV concaténés
-    df = pd.concat([pd.read_csv(f) for f in files], ignore_index=True)
-
-    # --- Renommer les colonnes selon rename_map ---
-    rename_map = cfg.get("rename_map", {})
-    if rename_map:
-        df = df.rename(columns=rename_map)
-        print(f"[INFO] Colonnes renommées : {rename_map}")
-
-    # --- Casting des types selon YAML ---
-    for col, target in cfg.get("casts", {}).items():
-        if col in df.columns:
-            df[col] = cast_series(df[col], target, cfg.get("date_formats", []))
-        elif strict_types:
-            warnings.warn(f"Missing column for cast: {col}")
-
-    # --- Normalisations spécifiques pour coller au validateur Mongo ---
-    # 1) gender -> 'M'|'F'|'X'|None
-    if "gender" in df.columns:
-        df["gender"] = normalize_gender_series(df["gender"])
-
-    # 2) room_number -> entier nullable
-    if "room_number" in df.columns:
-        df["room_number"] = normalize_room_number_series(df["room_number"])
-
-    # --- Groupement par patient -> documents prêts pour Mongo ---
-    docs = build_patient_docs(df, cfg)
-
-    # --- Connexion à MongoDB (utilisateur applicatif) ---
-    client = MongoClient(
-        host=os.getenv("MONGO_HOST"),
-        port=int(os.getenv("MONGO_PORT", "27017")),
-        username=os.getenv("MONGO_APP_USERNAME"),
-        password=os.getenv("MONGO_APP_PASSWORD"),
-        authSource=os.getenv("MONGO_DB"),
-    )
-    db = client[cfg["database"]]
-    coll = db[cfg["collection"]]
-
-    # --- IMPORTANT : desserrer le validateur pour billing_amount (avec fallback admin) ---
-    ensure_billing_negative_allowed(db, cfg["collection"])
-
-    # --- Insertion par lots (messages < 16MB) ---
-    inserted = 0
-    if not docs:
-        print("[INFO] No documents to insert.")
-    else:
-        BATCH_SIZE = 1000  # Sûr. On peut augmenter si besoin.
-        try:
-            for i in range(0, len(docs), BATCH_SIZE):
-                batch = docs[i:i + BATCH_SIZE]
-                res = coll.insert_many(batch, ordered=False)
-                inserted += len(res.inserted_ids)
-            print(f"[INFO] Inserted {inserted} patient documents in batches of {BATCH_SIZE}.")
-        except BulkWriteError as bwe:
-            details = bwe.details or {}
-            write_errors = details.get("writeErrors", [])
-            print(f"[ERROR] BulkWriteError: {len(write_errors)} erreurs. Détails (extrait):")
-            for e in write_errors[:5]:
-                print(f"  - idx={e.get('index')} code={e.get('code')} err={e.get('errmsg')}")
-            raise
-
-    # --- Indexes robustes (ne casse pas les index existants, évite les conflits) ---
-    ensure_indexes(coll, cfg.get("indexes", []))
-    print("[INFO] Indexes ensured.")
-    print("[INFO] Migration completed successfully.")
-    return inserted
-
-
-def build_mongo_client(cfg: dict) -> MongoClient:
-    return MongoClient(
-        host=os.getenv("MONGO_HOST"),
-        port=int(os.getenv("MONGO_PORT", "27017")),
-        username=os.getenv("MONGO_APP_USERNAME"),
-        password=os.getenv("MONGO_APP_PASSWORD"),
-        authSource=os.getenv("MONGO_DB"),
-    )
-
+# =======================================================================
+# 🚀 MAIN : enchaînement complet
+# =======================================================================
 
 def main():
-    load_dotenv(override=True)
-    cfg = load_config("config.yaml")
+    # 1️⃣ Charger la config
+    CSV_PATH, REPORTS_DIR, MONGO_URI, DB_NAME, ENABLE_MONGO_INSERT = load_config()
 
-    parser = argparse.ArgumentParser(description="ETL CSV -> MongoDB + Validation")
-    sub = parser.add_subparsers(dest="command")
+    # 2️⃣ Lire le CSV et résumer
+    df = read_data(CSV_PATH)
+    print("✅ Lecture terminée")
+    summarize(df)
 
-    p_migrate = sub.add_parser("migrate", help="Exécuter l'ETL (par défaut)")
-    p_migrate.add_argument("--and-validate", action="store_true",
-                           help="Exécuter l'ETL puis la validation")
+    # 3️⃣ Supprimer les doublons stricts
+    df = clean(df)
+    print("✅ Nettoyage terminé")
 
-    sub.add_parser("validate", help="Exécuter uniquement la validation")
+    # 4️⃣ Vérifier s’il y a des multi-admissions
+    debug_multi_admissions_from_csv(df, REPORTS_DIR)
 
-    # Comportement par défaut = migrate
-    args = parser.parse_args()
-    if args.command in (None, "migrate"):
-        inserted = run_migration(cfg)
-        if args.command == "migrate" and getattr(args, "and-validate", False):
-            client = build_mongo_client(cfg)
-            validate_and_write_report(cfg, client)
-    elif args.command == "validate":
-        client = build_mongo_client(cfg)
-        validate_and_write_report(cfg, client)
+    # 5️⃣ Regrouper et construire les docs
+    grouped = group_patients(df)
+    print(f"✅ Groupement terminé -> {len(grouped)} patients uniques")
+    docs = make_docs(grouped)
+    print(f"📦 Documents prêts: {len(docs)}")
+
+    # 6️⃣ Export JSON
+    export_patients_json(docs, REPORTS_DIR)
+
+    # 7️⃣ Envoi vers MongoDB (optionnel)
+    if ENABLE_MONGO_INSERT:
+        client = get_client(MONGO_URI)
+        wait_for_mongo(client)
+        upsert_mongo(docs, client, DB_NAME, "patients")
     else:
-        parser.print_help()
+        print("ℹ️ Insertion Mongo désactivée.")
 
-
+# Point d’entrée du script
 if __name__ == "__main__":
     main()
